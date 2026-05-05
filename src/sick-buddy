@@ -1,42 +1,61 @@
 #!/usr/bin/env python3
-"""SickBuddy - 生病管理助手"""
+"""SickBuddy - 生病管理助手 v1.3.0"""
 
 import json
 import os
 import sys
-import time
+import re
+import subprocess
 from datetime import datetime, timedelta
 
 DATA_DIR = os.path.expanduser("~/.openclaw/workspace/sick-buddy-data")
 PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
 LOG_FILE = os.path.join(DATA_DIR, "daily-log.json")
+MEDICINE_FILE = os.path.join(DATA_DIR, "medicines.json")
+RECOVERY_FILE = os.path.join(DATA_DIR, "recovery.json")
+
+# ── 基础 I/O ──
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-def load_profile():
+def load_json(filepath, default):
     ensure_data_dir()
-    if os.path.exists(PROFILE_FILE):
-        with open(PROFILE_FILE) as f:
+    if os.path.exists(filepath):
+        with open(filepath) as f:
             return json.load(f)
-    return {"conditions": [], "created_at": None, "city": None, "workplace": None}
+    return default
+
+def save_json(filepath, data):
+    ensure_data_dir()
+    with open(filepath, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_profile():
+    return load_json(PROFILE_FILE, {"conditions": [], "created_at": None, "city": None, "workplace": None})
 
 def save_profile(profile):
-    ensure_data_dir()
-    with open(PROFILE_FILE, "w") as f:
-        json.dump(profile, f, ensure_ascii=False, indent=2)
+    save_json(PROFILE_FILE, profile)
 
 def load_log():
-    ensure_data_dir()
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            return json.load(f)
-    return {"entries": []}
+    return load_json(LOG_FILE, {"entries": []})
 
 def save_log(log):
-    ensure_data_dir()
-    with open(LOG_FILE, "w") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+    save_json(LOG_FILE, log)
+
+def load_medicines():
+    return load_json(MEDICINE_FILE, {"medicines": []})
+
+def save_medicines(data):
+    save_json(MEDICINE_FILE, data)
+
+def load_recovery():
+    return load_json(RECOVERY_FILE, {"scores": []})
+
+def save_recovery(data):
+    save_json(RECOVERY_FILE, data)
+
+# ── 原有命令 ──
 
 def cmd_start(args):
     """Start tracking a condition"""
@@ -64,7 +83,14 @@ def cmd_start(args):
     save_profile(profile)
     print(f"✅ 已记录：{condition_name}")
     print(f"📅 开始日期：{new_condition['start_date']}")
-    print(f"📋 请告诉AI你的症状，帮你推测具体病症和病程")
+    
+    # Feature C: 自动查天气+流行病
+    city = profile.get("city")
+    if city:
+        print()
+        print_weather_and_epidemic(city)
+    else:
+        print("💡 设置城市可自动查询当地天气和流行病：sick-buddy set city <城市名>")
 
 def cmd_log(args):
     """Log today's status"""
@@ -111,7 +137,22 @@ def cmd_status():
         print(f"      今天：第{days}天")
         print(f"      症状：{', '.join(c['symptoms']) if c['symptoms'] else '待补充'}")
         print(f"      确认：{'✅' if c['confirmed'] else '⏳ 待确认'}")
+    
+    # 显示用药
+    med_data = load_medicines()
+    if med_data["medicines"]:
         print()
+        print("   💊 当前用药：")
+        for m in med_data["medicines"]:
+            if not m.get("stopped"):
+                print(f"      {m['name']} — {m['dosage']}，{m['frequency']}")
+    
+    # 显示恢复进度
+    rec_data = load_recovery()
+    if rec_data["scores"]:
+        latest = rec_data["scores"][-1]
+        print()
+        print(f"   📊 最近恢复评分：{latest['score']}/10（{latest['date']}）")
 
 def cmd_set(args):
     """Set profile info"""
@@ -163,7 +204,6 @@ def cmd_symptoms(args):
             print(f"   当前症状：{', '.join(c['symptoms'])}")
             return
     
-    # If all confirmed, add to last one
     c = profile["conditions"][-1]
     for s in args:
         if s not in c["symptoms"]:
@@ -175,10 +215,10 @@ def cmd_clear():
     """Clear all data"""
     profile = load_profile()
     if profile["conditions"]:
-        for f in [PROFILE_FILE, LOG_FILE]:
+        for f in [PROFILE_FILE, LOG_FILE, MEDICINE_FILE, RECOVERY_FILE]:
             if os.path.exists(f):
                 os.remove(f)
-        print("✅ 已清除所有生病记录")
+        print("✅ 已清除所有记录（含用药和恢复数据）")
     else:
         print("📋 没有需要清除的记录")
 
@@ -193,7 +233,446 @@ def cmd_history():
     for e in log["entries"][-10:]:
         print(f"   {e['date']} {e['time']} — {e['status']}")
 
-# --- Disease suggestion database ---
+# ── Feature A: 用药提醒 + 药物冲突检测 ──
+
+# 常见药物成分冲突数据库
+DRUG_CONFLICTS = {
+    "对乙酰氨基酚": {
+        "alias": ["扑热息痛", "泰诺", "必理通", "paracetamol", "acetaminophen"],
+        "max_daily_mg": 2000,
+        "conflicts": ["对乙酰氨基酚"],  # 自身不可叠加
+        "warning": "每日不超过2g，多种感冒药中可能含有",
+    },
+    "布洛芬": {
+        "alias": ["芬必得", "美林", "ibuprofen"],
+        "max_daily_mg": 1200,
+        "conflicts": ["阿司匹林"],
+        "warning": "肠胃炎时避免空腹服用",
+    },
+    "阿司匹林": {
+        "alias": ["拜阿司匹灵", "aspirin"],
+        "max_daily_mg": 3000,
+        "conflicts": ["布洛芬", "对乙酰氨基酚"],
+        "warning": "登革热患者禁用（出血风险）",
+    },
+    "氯雷他定": {
+        "alias": ["开瑞坦", "loratadine"],
+        "conflicts": [],
+        "warning": "抗组胺药，可能引起嗜睡",
+    },
+    "头孢": {
+        "alias": ["头孢类", "cephalosporin"],
+        "conflicts": ["酒精"],
+        "warning": "服用头孢期间及停药后7天内禁止饮酒（双硫仑样反应）",
+    },
+    "奥司他韦": {
+        "alias": ["达菲", "tamiflu", "oseltamivir"],
+        "conflicts": [],
+        "warning": "流感特效药，48小时内服用效果最佳",
+    },
+}
+
+def normalize_drug_name(name):
+    """标准化药物名称，匹配成分"""
+    name_lower = name.lower()
+    for ingredient, info in DRUG_CONFLICTS.items():
+        if ingredient in name_lower or ingredient.lower() in name_lower:
+            return ingredient
+        for alias in info.get("alias", []):
+            if alias.lower() in name_lower:
+                return ingredient
+    return None
+
+def check_drug_conflicts(new_drug, existing_medicines):
+    """检查新药物与已有药物的冲突"""
+    warnings = []
+    new_ingredient = normalize_drug_name(new_drug)
+    
+    if not new_ingredient:
+        return warnings
+    
+    new_info = DRUG_CONFLICTS.get(new_ingredient, {})
+    
+    # 自身警告
+    if "warning" in new_info:
+        warnings.append(f"⚠️ {new_ingredient}：{new_info['warning']}")
+    
+    # 与已有药物冲突
+    for med in existing_medicines:
+        if med.get("stopped"):
+            continue
+        existing_ingredient = normalize_drug_name(med["name"])
+        if not existing_ingredient:
+            continue
+        
+        # 检查冲突列表
+        conflicts = new_info.get("conflicts", [])
+        if existing_ingredient in conflicts or existing_ingredient == new_ingredient:
+            warnings.append(f"🔴 冲突：{new_ingredient} 与 {existing_ingredient}（{med['name']}）存在冲突！")
+        
+        # 双重检查反向
+        existing_info = DRUG_CONFLICTS.get(existing_ingredient, {})
+        if new_ingredient in existing_info.get("conflicts", []):
+            warnings.append(f"🔴 冲突：{existing_ingredient}（{med['name']}）与 {new_ingredient} 存在冲突！")
+    
+    return warnings
+
+def cmd_medicine(args):
+    """用药管理"""
+    if not args:
+        print("💊 用药管理命令：")
+        print("  medicine add <药名> <剂量> <频次>  添加用药")
+        print("  medicine list                     查看当前用药")
+        print("  medicine stop <药名>              停用药物")
+        print("  medicine check <药名>             检查冲突")
+        print()
+        print("  Example: sick-buddy medicine add 泰诺 1粒 每日3次")
+        print("           sick-buddy medicine check 布洛芬")
+        return
+    
+    subcmd = args[0]
+    sub_args = args[1:]
+    
+    if subcmd == "add":
+        if len(sub_args) < 3:
+            print("Usage: sick-buddy medicine add <药名> <剂量> <频次>")
+            print("Example: sick-buddy medicine add 泰诺 1粒 每日3次")
+            sys.exit(1)
+        
+        name = sub_args[0]
+        dosage = sub_args[1]
+        frequency = " ".join(sub_args[2:])
+        
+        med_data = load_medicines()
+        
+        # 冲突检查
+        warnings = check_drug_conflicts(name, med_data["medicines"])
+        
+        new_med = {
+            "name": name,
+            "dosage": dosage,
+            "frequency": frequency,
+            "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "stopped": None,
+        }
+        
+        med_data["medicines"].append(new_med)
+        save_medicines(med_data)
+        
+        print(f"✅ 已添加用药：{name} {dosage} {frequency}")
+        if warnings:
+            print()
+            for w in warnings:
+                print(f"   {w}")
+    
+    elif subcmd == "list":
+        med_data = load_medicines()
+        if not med_data["medicines"]:
+            print("📋 当前没有用药记录")
+            return
+        
+        print("💊 当前用药：\n")
+        active = [m for m in med_data["medicines"] if not m.get("stopped")]
+        stopped = [m for m in med_data["medicines"] if m.get("stopped")]
+        
+        if active:
+            for i, m in enumerate(active):
+                ingredient = normalize_drug_name(m["name"])
+                ingredient_str = f"（{ingredient}）" if ingredient else ""
+                print(f"   ✅ {m['name']}{ingredient_str}")
+                print(f"      {m['dosage']}，{m['frequency']}")
+                print(f"      开始：{m['started']}")
+                print()
+        
+        if stopped:
+            print("   已停用：")
+            for m in stopped:
+                print(f"   ❌ {m['name']} — 停用于 {m['stopped']}")
+            print()
+    
+    elif subcmd == "stop":
+        if not sub_args:
+            print("Usage: sick-buddy medicine stop <药名>")
+            sys.exit(1)
+        
+        name = " ".join(sub_args)
+        med_data = load_medicines()
+        found = False
+        
+        for m in med_data["medicines"]:
+            if name in m["name"] or m["name"] in name:
+                if not m.get("stopped"):
+                    m["stopped"] = datetime.now().strftime("%Y-%m-%d")
+                    found = True
+                    print(f"✅ 已停用：{m['name']}")
+        
+        if found:
+            save_medicines(med_data)
+        else:
+            print(f"❌ 未找到正在使用的药物：{name}")
+    
+    elif subcmd == "check":
+        if not sub_args:
+            print("Usage: sick-buddy medicine check <药名>")
+            sys.exit(1)
+        
+        name = " ".join(sub_args)
+        med_data = load_medicines()
+        
+        print(f"🔍 检查 {name} 的药物冲突...\n")
+        
+        ingredient = normalize_drug_name(name)
+        if ingredient:
+            info = DRUG_CONFLICTS.get(ingredient, {})
+            print(f"   识别成分：{ingredient}")
+            if "warning" in info:
+                print(f"   ⚠️ 注意：{info['warning']}")
+        
+        warnings = check_drug_conflicts(name, med_data["medicines"])
+        if warnings:
+            for w in warnings:
+                print(f"   {w}")
+        else:
+            print("   ✅ 未发现与当前用药的冲突")
+    
+    else:
+        print(f"❌ 未知子命令：{subcmd}")
+        print("   可用: add, list, stop, check")
+
+# ── Feature B: 恢复进度追踪 ──
+
+RECOVERY_ADVICE = {
+    range(0, 3): "严重不适，建议就医。多休息、多补水。",
+    range(3, 5): "状态较差，继续休息。按时服药，注意观察。",
+    range(5, 7): "正在恢复中。保持休息，可以适当活动。",
+    range(7, 9): "接近恢复。可以尝试轻度工作，注意不要劳累。",
+    range(9, 11): "基本恢复！可以正常活动。",
+}
+
+def get_recovery_advice(score):
+    """根据恢复评分给出建议"""
+    for score_range, advice in RECOVERY_ADVICE.items():
+        if score in score_range:
+            return advice
+    return "继续观察。"
+
+def cmd_recover(args):
+    """恢复进度追踪"""
+    if not args:
+        print("📊 恢复追踪命令：")
+        print("  recover score <1-10>    记录今日恢复评分")
+        print("  recover chart           查看恢复曲线")
+        print("  recover advise          获取恢复建议")
+        print()
+        print("  评分标准：1=非常差，5=一半一半，10=完全恢复")
+        return
+    
+    subcmd = args[0]
+    sub_args = args[1:]
+    
+    if subcmd == "score":
+        if not sub_args:
+            print("Usage: sick-buddy recover score <1-10> [备注]")
+            sys.exit(1)
+        
+        try:
+            score = int(sub_args[0])
+        except ValueError:
+            print("❌ 评分必须是1-10的数字")
+            sys.exit(1)
+        
+        if score < 1 or score > 10:
+            print("❌ 评分范围：1-10")
+            sys.exit(1)
+        
+        note = " ".join(sub_args[1:]) if len(sub_args) > 1 else ""
+        
+        rec_data = load_recovery()
+        entry = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "time": datetime.now().strftime("%H:%M"),
+            "score": score,
+            "note": note,
+        }
+        rec_data["scores"].append(entry)
+        save_recovery(rec_data)
+        
+        advice = get_recovery_advice(score)
+        
+        # 趋势分析
+        trend = ""
+        if len(rec_data["scores"]) >= 2:
+            prev = rec_data["scores"][-2]["score"]
+            diff = score - prev
+            if diff > 0:
+                trend = f" 📈 比上次提升{diff}分"
+            elif diff < 0:
+                trend = f" 📉 比上次下降{abs(diff)}分"
+            else:
+                trend = " ➡️ 与上次持平"
+        
+        print(f"✅ 已记录恢复评分：{score}/10{trend}")
+        print(f"   💡 {advice}")
+        
+        # 低分提醒
+        if score <= 3 and len(rec_data["scores"]) >= 3:
+            recent_3 = [s["score"] for s in rec_data["scores"][-3:]]
+            if all(s <= 3 for s in recent_3):
+                print(f"   ⚠️ 连续3天评分≤3，建议就医复查")
+    
+    elif subcmd == "chart":
+        rec_data = load_recovery()
+        if not rec_data["scores"]:
+            print("📋 还没有恢复记录")
+            return
+        
+        print("📊 恢复曲线：\n")
+        
+        max_score = max(s["score"] for s in rec_data["scores"])
+        
+        for entry in rec_data["scores"][-14:]:  # 最近14天
+            bar_len = entry["score"]
+            bar = "█" * bar_len + "░" * (10 - bar_len)
+            note_str = f" {entry['note']}" if entry.get("note") else ""
+            print(f"   {entry['date']} [{bar}] {entry['score']}/10{note_str}")
+        
+        if len(rec_data["scores"]) >= 3:
+            avg_3 = sum(s["score"] for s in rec_data["scores"][-3:]) / 3
+            print(f"\n   近3天平均：{avg_3:.1f}/10")
+            
+            first = rec_data["scores"][0]["score"]
+            latest = rec_data["scores"][-1]["score"]
+            if latest > first:
+                print(f"   总体趋势：📈 上升（从{first}到{latest}）")
+            elif latest < first:
+                print(f"   总体趋势：📉 下降（从{first}到{latest}），建议就医")
+            else:
+                print(f"   总体趋势：➡️ 持平")
+    
+    elif subcmd == "advise":
+        rec_data = load_recovery()
+        if not rec_data["scores"]:
+            print("📋 还没有恢复记录，先评分：sick-buddy recover score <1-10>")
+            return
+        
+        latest = rec_data["scores"][-1]
+        advice = get_recovery_advice(latest["score"])
+        
+        print(f"💡 恢复建议（当前评分：{latest['score']}/10）\n")
+        print(f"   {advice}")
+        
+        # 用药提醒
+        med_data = load_medicines()
+        active_meds = [m for m in med_data["medicines"] if not m.get("stopped")]
+        if active_meds:
+            print(f"\n   💊 当前用药：")
+            for m in active_meds:
+                print(f"      {m['name']} — {m['frequency']}")
+        
+        # 复诊建议
+        profile = load_profile()
+        if profile["conditions"]:
+            for c in profile["conditions"]:
+                start = datetime.strptime(c["start_date"], "%Y-%m-%d")
+                days = (datetime.now() - start).days + 1
+                if days >= 7 and latest["score"] <= 5:
+                    print(f"\n   ⚠️ {c['name']}已{days}天，恢复评分仍≤5，建议复诊")
+    
+    else:
+        print(f"❌ 未知子命令：{subcmd}")
+        print("   可用: score, chart, advise")
+
+# ── Feature C: 天气+流行病查询 ──
+
+def get_weather(city):
+    """通过 curl wttr.in 获取天气"""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", f"wttr.in/{city}?format=%C+%t+%h+%w&lang=zh"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+def get_epidemic_info(city):
+    """获取流行病信息（基于当前月份的知识库匹配）"""
+    month = datetime.now().month
+    
+    # 季节性流行病参考
+    epidemic_db = {
+        "春季": {
+            "months": [3, 4, 5],
+            "diseases": ["流感", "花粉过敏", "感冒", "咽炎"],
+            "tips": "春季气温变化大，注意增减衣物",
+        },
+        "夏季": {
+            "months": [6, 7, 8],
+            "diseases": ["肠胃炎", "中暑", "食物中毒", "登革热"],
+            "tips": "夏季注意饮食卫生，南方注意防蚊",
+        },
+        "秋季": {
+            "months": [9, 10, 11],
+            "diseases": ["感冒", "过敏", "咽炎", "支原体"],
+            "tips": "秋季干燥，注意补水和呼吸道保护",
+        },
+        "冬季": {
+            "months": [12, 1, 2],
+            "diseases": ["流感", "感冒", "支原体", "新冠"],
+            "tips": "冬季流感高发，注意保暖和室内通风",
+        },
+    }
+    
+    season = None
+    for s, info in epidemic_db.items():
+        if month in info["months"]:
+            season = s
+            return {
+                "season": season,
+                "diseases": info["diseases"],
+                "tips": info["tips"],
+            }
+    
+    return None
+
+def print_weather_and_epidemic(city):
+    """打印天气和流行病信息"""
+    print(f"📍 {city} 环境信息：")
+    
+    # 天气
+    weather = get_weather(city)
+    if weather:
+        print(f"   🌤️ 天气：{weather}")
+    else:
+        print(f"   🌤️ 天气：无法获取（需要网络）")
+    
+    # 流行病
+    epidemic = get_epidemic_info(city)
+    if epidemic:
+        print(f"   📅 当前季节：{epidemic['season']}")
+        print(f"   🦠 高发病：{', '.join(epidemic['diseases'])}")
+        print(f"   💡 {epidemic['tips']}")
+    
+    print()
+
+def cmd_weather(args):
+    """查询天气和流行病"""
+    profile = load_profile()
+    city = None
+    
+    if args:
+        city = " ".join(args)
+    elif profile.get("city"):
+        city = profile["city"]
+    else:
+        print("❌ 请指定城市或先设置：sick-buddy set city <城市名>")
+        sys.exit(1)
+    
+    print_weather_and_epidemic(city)
+
+# ── Feature: suggest / template（已有，保留） ──
 
 SUGGESTIONS = {
     1: [
@@ -240,7 +719,6 @@ def cmd_suggest(args):
         print("❌ 天数范围: 1-30")
         sys.exit(1)
     
-    # Find the closest key
     keys = sorted(SUGGESTIONS.keys())
     closest = min(keys, key=lambda k: abs(k - days))
     
@@ -254,8 +732,6 @@ def cmd_suggest(args):
     
     print("💡 提示：这只是参考，请根据实际症状选择。")
     print("   确定后运行 sick-buddy start <病症名>")
-
-# --- Leave template generator ---
 
 TEMPLATES = {
     "formal": {
@@ -292,17 +768,13 @@ def cmd_template(args):
         print(f"   可选: {', '.join(TEMPLATES[style].keys())}")
         sys.exit(1)
     
-    # Load profile for auto-fill
     profile = load_profile()
-    
     template = TEMPLATES[style][scene]
     
-    # Auto-fill from profile where possible
     condition = ""
     if profile["conditions"]:
         condition = profile["conditions"][-1]["name"]
     
-    # Show template with placeholders
     print("📝 请假模板：")
     print("─" * 40)
     print(template)
@@ -310,7 +782,6 @@ def cmd_template(args):
     print()
     print("📋 占位符说明：")
     placeholders = set()
-    import re
     for match in re.finditer(r'\{([^}]+)\}', template):
         placeholders.add(match.group(1))
     
@@ -324,21 +795,26 @@ def cmd_template(args):
     print()
     print("💡 提示：让AI帮你自动填写，直接说'帮我生成请假消息'即可")
 
+# ── Main ──
+
 def main():
     if len(sys.argv) < 2:
-        print("🤒 SickBuddy — 生病管理助手")
+        print("🤒 SickBuddy — 生病管理助手 v1.3.0")
         print()
         print("Commands:")
-        print("  start <condition>    开始记录病症")
-        print("  log <status>         记录今日状态")
-        print("  symptoms <s1> <s2>   添加症状")
-        print("  confirm <condition>  确认病症")
-        print("  suggest <days>       根据天数推荐病症")
-        print("  template <style> [scene]  生成请假模板")
-        print("  set <key> <value>    设置信息 (city/workplace/system)")
-        print("  status               查看当前状态")
-        print("  history              查看历史记录")
-        print("  clear                清除所有记录")
+        print("  start <condition>        开始记录病症")
+        print("  log <status>             记录今日状态")
+        print("  symptoms <s1> <s2>       添加症状")
+        print("  confirm <condition>      确认病症")
+        print("  suggest <days>           根据天数推荐病症")
+        print("  template <style> [scene] 生成请假模板")
+        print("  medicine <add|list|stop|check>  用药管理 💊")
+        print("  recover <score|chart|advise>    恢复追踪 📊")
+        print("  weather [city]           天气+流行病查询 🌤️")
+        print("  set <key> <value>        设置信息")
+        print("  status                   查看当前状态")
+        print("  history                  查看历史记录")
+        print("  clear                    清除所有记录")
         sys.exit(0)
     
     cmd = sys.argv[1]
@@ -353,6 +829,9 @@ def main():
         "symptoms": cmd_symptoms,
         "suggest": cmd_suggest,
         "template": cmd_template,
+        "medicine": cmd_medicine,
+        "recover": cmd_recover,
+        "weather": cmd_weather,
         "clear": lambda a: cmd_clear(),
         "history": lambda a: cmd_history(),
     }
