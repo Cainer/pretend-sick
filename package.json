@@ -1,0 +1,14 @@
+{
+  "name": "sick-buddy",
+  "version": "1.1.0",
+  "description": "生病管理助手 - 记录病症、症状预期、请假话术、每日提醒",
+  "main": "src/sick-buddy",
+  "bin": {
+    "sick-buddy": "src/sick-buddy"
+  },
+  "scripts": {
+    "start": "node src/sick-buddy"
+  },
+  "keywords": ["health", "sick", "leave", "请假", "生病", "openclaw", "openclaw-skill"],
+  "license": "MIT"
+}

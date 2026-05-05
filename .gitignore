@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+sick-buddy-data/
+node_modules/

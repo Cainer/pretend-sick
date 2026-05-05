@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""SickBuddy - 生病管理助手"""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+
+DATA_DIR = os.path.expanduser("~/.openclaw/workspace/sick-buddy-data")
+PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
+LOG_FILE = os.path.join(DATA_DIR, "daily-log.json")
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+def load_profile():
+    ensure_data_dir()
+    if os.path.exists(PROFILE_FILE):
+        with open(PROFILE_FILE) as f:
+            return json.load(f)
+    return {"conditions": [], "created_at": None, "city": None, "workplace": None}
+
+def save_profile(profile):
+    ensure_data_dir()
+    with open(PROFILE_FILE, "w") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+def load_log():
+    ensure_data_dir()
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            return json.load(f)
+    return {"entries": []}
+
+def save_log(log):
+    ensure_data_dir()
+    with open(LOG_FILE, "w") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
+def cmd_start(args):
+    """Start tracking a condition"""
+    if not args:
+        print("Usage: sick-buddy start <condition>")
+        print("Example: sick-buddy start 感冒")
+        sys.exit(1)
+    
+    condition_name = " ".join(args)
+    profile = load_profile()
+    
+    new_condition = {
+        "name": condition_name,
+        "start_date": datetime.now().strftime("%Y-%m-%d"),
+        "start_time": datetime.now().strftime("%H:%M"),
+        "confirmed": False,
+        "symptoms": [],
+        "day": 1
+    }
+    
+    profile["conditions"].append(new_condition)
+    if not profile["created_at"]:
+        profile["created_at"] = datetime.now().isoformat()
+    
+    save_profile(profile)
+    print(f"✅ 已记录：{condition_name}")
+    print(f"📅 开始日期：{new_condition['start_date']}")
+    print(f"📋 请告诉AI你的症状，帮你推测具体病症和病程")
+
+def cmd_log(args):
+    """Log today's status"""
+    if not args:
+        print("Usage: sick-buddy log <status>")
+        sys.exit(1)
+    
+    profile = load_profile()
+    if not profile["conditions"]:
+        print("❌ 还没有记录病症，先运行 sick-buddy start <病症>")
+        sys.exit(1)
+    
+    status = " ".join(args)
+    log = load_log()
+    
+    entry = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M"),
+        "status": status,
+        "conditions": [c["name"] for c in profile["conditions"]]
+    }
+    
+    log["entries"].append(entry)
+    save_log(log)
+    print(f"✅ 已记录今日状态：{status}")
+
+def cmd_status():
+    """Show current status"""
+    profile = load_profile()
+    if not profile["conditions"]:
+        print("📋 当前没有记录的病症")
+        return
+    
+    print("📋 当前生病状态：")
+    print(f"   城市：{profile.get('city', '未设置')}")
+    print(f"   工作/学校：{profile.get('workplace', '未设置')}")
+    print()
+    
+    for c in profile["conditions"]:
+        start = datetime.strptime(c["start_date"], "%Y-%m-%d")
+        days = (datetime.now() - start).days + 1
+        print(f"   🤒 {c['name']}")
+        print(f"      开始：{c['start_date']}")
+        print(f"      今天：第{days}天")
+        print(f"      症状：{', '.join(c['symptoms']) if c['symptoms'] else '待补充'}")
+        print(f"      确认：{'✅' if c['confirmed'] else '⏳ 待确认'}")
+        print()
+
+def cmd_set(args):
+    """Set profile info"""
+    if len(args) < 2:
+        print("Usage: sick-buddy set <key> <value>")
+        print("Keys: city, workplace, system")
+        sys.exit(1)
+    
+    key, value = args[0], " ".join(args[1:])
+    profile = load_profile()
+    profile[key] = value
+    save_profile(profile)
+    print(f"✅ 已设置 {key} = {value}")
+
+def cmd_confirm(args):
+    """Confirm a condition"""
+    if not args:
+        print("Usage: sick-buddy confirm <condition_name>")
+        sys.exit(1)
+    
+    name = " ".join(args)
+    profile = load_profile()
+    for c in profile["conditions"]:
+        if name in c["name"] or c["name"] in name:
+            c["confirmed"] = True
+            save_profile(profile)
+            print(f"✅ 已确认病症：{c['name']}")
+            return
+    print(f"❌ 未找到病症：{name}")
+
+def cmd_symptoms(args):
+    """Add symptoms to current condition"""
+    if not args:
+        print("Usage: sick-buddy symptoms <symptom1> <symptom2> ...")
+        sys.exit(1)
+    
+    profile = load_profile()
+    if not profile["conditions"]:
+        print("❌ 还没有记录病症")
+        sys.exit(1)
+    
+    for c in profile["conditions"]:
+        if not c["confirmed"]:
+            for s in args:
+                if s not in c["symptoms"]:
+                    c["symptoms"].append(s)
+            save_profile(profile)
+            print(f"✅ 已添加症状：{', '.join(args)}")
+            print(f"   当前症状：{', '.join(c['symptoms'])}")
+            return
+    
+    # If all confirmed, add to last one
+    c = profile["conditions"][-1]
+    for s in args:
+        if s not in c["symptoms"]:
+            c["symptoms"].append(s)
+    save_profile(profile)
+    print(f"✅ 已添加症状：{', '.join(args)}")
+
+def cmd_clear():
+    """Clear all data"""
+    profile = load_profile()
+    if profile["conditions"]:
+        for f in [PROFILE_FILE, LOG_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+        print("✅ 已清除所有生病记录")
+    else:
+        print("📋 没有需要清除的记录")
+
+def cmd_history():
+    """Show log history"""
+    log = load_log()
+    if not log["entries"]:
+        print("📋 还没有记录")
+        return
+    
+    print("📜 状态记录：")
+    for e in log["entries"][-10:]:
+        print(f"   {e['date']} {e['time']} — {e['status']}")
+
+def main():
+    if len(sys.argv) < 2:
+        print("🤒 SickBuddy — 生病管理助手")
+        print()
+        print("Commands:")
+        print("  start <condition>    开始记录病症")
+        print("  log <status>         记录今日状态")
+        print("  symptoms <s1> <s2>   添加症状")
+        print("  confirm <condition>  确认病症")
+        print("  set <key> <value>    设置信息 (city/workplace/system)")
+        print("  status               查看当前状态")
+        print("  history              查看历史记录")
+        print("  clear                清除所有记录")
+        sys.exit(0)
+    
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+    
+    commands = {
+        "start": cmd_start,
+        "log": cmd_log,
+        "status": lambda a: cmd_status(),
+        "set": cmd_set,
+        "confirm": cmd_confirm,
+        "symptoms": cmd_symptoms,
+        "clear": lambda a: cmd_clear(),
+        "history": lambda a: cmd_history(),
+    }
+    
+    if cmd in commands:
+        commands[cmd](args)
+    else:
+        print(f"❌ 未知命令：{cmd}")
+        print("   运行 sick-buddy 查看帮助")
+
+if __name__ == "__main__":
+    main()
