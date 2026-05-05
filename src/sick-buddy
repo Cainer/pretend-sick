@@ -193,6 +193,137 @@ def cmd_history():
     for e in log["entries"][-10:]:
         print(f"   {e['date']} {e['time']} — {e['status']}")
 
+# --- Disease suggestion database ---
+
+SUGGESTIONS = {
+    1: [
+        {"name": "偏头痛", "match": "头痛+恶心，发作快恢复也快", "severity": "轻"},
+        {"name": "急性荨麻疹", "match": "过敏反应，用药后很快缓解", "severity": "轻"},
+        {"name": "急性结膜炎", "match": "红眼、分泌物多，传染性强不便上班", "severity": "轻"},
+    ],
+    2: [
+        {"name": "普通感冒（轻）", "match": "鼻塞+咽痛，不发烧或低烧", "severity": "轻"},
+        {"name": "急性肠胃炎", "match": "上吐下泻，第2天最重然后好转", "severity": "中"},
+        {"name": "痛风急性发作", "match": "关节剧痛红肿，无法行走", "severity": "中"},
+    ],
+    3: [
+        {"name": "普通感冒", "match": "鼻塞+咳嗽+可能低烧，第2-3天高峰", "severity": "中"},
+        {"name": "咽炎/扁桃体炎", "match": "嗓子剧痛+吞咽困难+可能发烧", "severity": "中"},
+        {"name": "颈椎病急性发作", "match": "颈肩剧痛+活动受限+头晕", "severity": "中"},
+    ],
+    5: [
+        {"name": "流感", "match": "突发高烧+全身酸痛+极度乏力", "severity": "中重"},
+        {"name": "支原体肺炎", "match": "持续干咳+发烧+胸痛", "severity": "重"},
+        {"name": "新冠感染", "match": "咽痛+发烧+咳嗽+可能味觉减退", "severity": "中重"},
+    ],
+    7: [
+        {"name": "流感（重症）", "match": "高烧持续+咳嗽剧烈+乏力数周", "severity": "重"},
+        {"name": "新冠感染（中症）", "match": "持续发烧+咳嗽+气短+乏力", "severity": "重"},
+        {"name": "登革热", "match": "高烧+骨痛+皮疹（南方地区）", "severity": "重"},
+    ],
+}
+
+def cmd_suggest(args):
+    """Suggest conditions based on desired leave days"""
+    if not args:
+        print("Usage: sick-buddy suggest <days>")
+        print("Example: sick-buddy suggest 3")
+        sys.exit(1)
+    
+    try:
+        days = int(args[0])
+    except ValueError:
+        print("❌ 天数必须是数字")
+        sys.exit(1)
+    
+    if days < 1 or days > 30:
+        print("❌ 天数范围: 1-30")
+        sys.exit(1)
+    
+    # Find the closest key
+    keys = sorted(SUGGESTIONS.keys())
+    closest = min(keys, key=lambda k: abs(k - days))
+    
+    print(f"🎯 想请 {days} 天假，推荐以下病症：")
+    print(f"   （基于 {closest} 天病程匹配）\n")
+    
+    for i, s in enumerate(SUGGESTIONS[closest], 1):
+        print(f"   {i}. {s['name']} [{s['severity']}]")
+        print(f"      特征：{s['match']}")
+        print()
+    
+    print("💡 提示：这只是参考，请根据实际症状选择。")
+    print("   确定后运行 sick-buddy start <病症名>")
+
+# --- Leave template generator ---
+
+TEMPLATES = {
+    "formal": {
+        "company": "{领导称呼}您好，\n\n我因{病症}身体不适，需要请假{天数}天休息（{开始日期}-{结束日期}）。\n目前工作已交接给{同事名}，紧急事项已安排妥当。\n如需紧急联系，可通过微信或电话联系我。\n\n给您和团队带来不便，非常抱歉。\n\n{姓名}\n{日期}",
+        "school": "{老师称呼}您好，\n\n我是{班级}的{姓名}，因{病症}需要请假{天数}天。\n落下的课程我会在恢复后补上。\n\n请予以批准，谢谢。\n\n{姓名}\n{日期}",
+    },
+    "casual": {
+        "company": "领导好，今天{病症}不太舒服，想请{天数}天假休息一下。工作已经交接好了，有事随时微信找我。麻烦批准，谢谢！",
+        "school": "老师好，今天{病症}不舒服，想请假{天数}天去休息。作业我会补上的，麻烦老师批准～",
+    },
+    "brief": {
+        "company": "老板，今天身体不太行，请假{天数}天🤒 有事微信滴我~",
+        "school": "老师，生病了请{天数}天假，回来补作业～",
+    },
+}
+
+def cmd_template(args):
+    """Generate a leave message template"""
+    if not args:
+        print("Usage: sick-buddy template <formal|casual|brief> [company|school]")
+        print("Example: sick-buddy template formal company")
+        print("         sick-buddy template casual school")
+        sys.exit(1)
+    
+    style = args[0]
+    if style not in TEMPLATES:
+        print(f"❌ 未知风格: {style}")
+        print(f"   可选: {', '.join(TEMPLATES.keys())}")
+        sys.exit(1)
+    
+    scene = args[1] if len(args) > 1 else "company"
+    if scene not in TEMPLATES[style]:
+        print(f"❌ 未知场景: {scene}")
+        print(f"   可选: {', '.join(TEMPLATES[style].keys())}")
+        sys.exit(1)
+    
+    # Load profile for auto-fill
+    profile = load_profile()
+    
+    template = TEMPLATES[style][scene]
+    
+    # Auto-fill from profile where possible
+    condition = ""
+    if profile["conditions"]:
+        condition = profile["conditions"][-1]["name"]
+    
+    # Show template with placeholders
+    print("📝 请假模板：")
+    print("─" * 40)
+    print(template)
+    print("─" * 40)
+    print()
+    print("📋 占位符说明：")
+    placeholders = set()
+    import re
+    for match in re.finditer(r'\{([^}]+)\}', template):
+        placeholders.add(match.group(1))
+    
+    for p in sorted(placeholders):
+        auto = ""
+        if p == "病症" and condition:
+            auto = f" → 自动填入：{condition}"
+        elif p == "天数" and profile["conditions"]:
+            auto = " → 请根据实际填写"
+        print(f"   {{{p}}}{auto}")
+    print()
+    print("💡 提示：让AI帮你自动填写，直接说'帮我生成请假消息'即可")
+
 def main():
     if len(sys.argv) < 2:
         print("🤒 SickBuddy — 生病管理助手")
@@ -202,6 +333,8 @@ def main():
         print("  log <status>         记录今日状态")
         print("  symptoms <s1> <s2>   添加症状")
         print("  confirm <condition>  确认病症")
+        print("  suggest <days>       根据天数推荐病症")
+        print("  template <style> [scene]  生成请假模板")
         print("  set <key> <value>    设置信息 (city/workplace/system)")
         print("  status               查看当前状态")
         print("  history              查看历史记录")
@@ -218,6 +351,8 @@ def main():
         "set": cmd_set,
         "confirm": cmd_confirm,
         "symptoms": cmd_symptoms,
+        "suggest": cmd_suggest,
+        "template": cmd_template,
         "clear": lambda a: cmd_clear(),
         "history": lambda a: cmd_history(),
     }
